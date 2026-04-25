@@ -3,12 +3,24 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Voice Recorder to n8n</title>
+  <title>Voice Recorder with Visualizer</title>
   <style>
     body { font-family: Arial, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
-    button { margin-right: 8px; margin-bottom: 12px; padding: 10px 16px; }
-    #status, #result { margin-top: 12px; white-space: pre-wrap; }
+    button { margin-right: 8px; margin-bottom: 12px; padding: 10px 16px; cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: 0.6; }
+    
+    #status, #result { margin-top: 12px; white-space: pre-wrap; word-break: break-all; }
     audio { display: block; margin-top: 12px; width: 100%; }
+
+    /* 視覺化 Bar 的樣式 */
+    #visualizer-container { 
+      width: 100%; height: 20px; background: #eee; 
+      margin: 15px 0; border-radius: 5px; overflow: hidden; 
+    }
+    #visualizer-bar { 
+      width: 0%; height: 100%; background: #4CAF50; 
+      transition: width 0.1s ease-out; 
+    }
   </style>
 </head>
 <body>
@@ -17,6 +29,10 @@
   <button id="startBtn">Start Recording</button>
   <button id="stopBtn" disabled>Stop Recording</button>
   <button id="uploadBtn" disabled>Upload to n8n</button>
+
+  <div id="visualizer-container">
+    <div id="visualizer-bar"></div>
+  </div>
 
   <audio id="player" controls></audio>
 
@@ -32,14 +48,30 @@
     const player = document.getElementById("player");
     const statusEl = document.getElementById("status");
     const resultEl = document.getElementById("result");
+    const visualizerBar = document.getElementById("visualizer-bar");
 
     let mediaRecorder = null;
     let audioChunks = [];
     let audioBlob = null;
     let stream = null;
+    
+    // 視覺化相關變數
+    let audioContext = null;
+    let animationId = null;
 
-    function setStatus(text) {
-      statusEl.textContent = text;
+    function setStatus(text) { statusEl.textContent = text; }
+
+    // 視覺化更新迴圈
+    function updateVisualizer(analyser) {
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(dataArray);
+      
+      let sum = 0;
+      for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+      const average = sum / dataArray.length;
+      
+      visualizerBar.style.width = Math.min(average * 2, 100) + "%";
+      animationId = requestAnimationFrame(() => updateVisualizer(analyser));
     }
 
     startBtn.addEventListener("click", async () => {
@@ -50,96 +82,64 @@
 
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-        let mimeType = "";
-        if (MediaRecorder.isTypeSupported("audio/webm")) {
-          mimeType = "audio/webm";
-        } else if (MediaRecorder.isTypeSupported("audio/mp4")) {
-          mimeType = "audio/mp4";
-        }
+        // 初始化錄音器
+        let mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
+        mediaRecorder = new MediaRecorder(stream, { mimeType });
 
-        mediaRecorder = mimeType
-          ? new MediaRecorder(stream, { mimeType })
-          : new MediaRecorder(stream);
-
-        mediaRecorder.ondataavailable = (event) => {
-          if (event.data && event.data.size > 0) {
-            audioChunks.push(event.data);
-          }
-        };
-
+        mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+        
         mediaRecorder.onstop = () => {
-          const finalType = mimeType || audioChunks[0]?.type || "audio/webm";
-          const extension = finalType.includes("mp4") ? "m4a" : "webm";
-
-          audioBlob = new Blob(audioChunks, { type: finalType });
-          const audioUrl = URL.createObjectURL(audioBlob);
-          player.src = audioUrl;
+          const extension = mimeType.includes("mp4") ? "m4a" : "webm";
+          audioBlob = new Blob(audioChunks, { type: mimeType });
+          player.src = URL.createObjectURL(audioBlob);
           uploadBtn.disabled = false;
           setStatus(`Recording stopped. File ready: recording.${extension}`);
         };
+
+        // 初始化視覺化
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        updateVisualizer(analyser);
 
         mediaRecorder.start();
         setStatus("Recording...");
         startBtn.disabled = true;
         stopBtn.disabled = false;
         uploadBtn.disabled = true;
-      } catch (error) {
-        console.error(error);
-        setStatus("Cannot access microphone: " + error.message);
+      } catch (err) {
+        setStatus("Error: " + err.message);
       }
     });
 
     stopBtn.addEventListener("click", () => {
-      if (mediaRecorder && mediaRecorder.state !== "inactive") {
-        mediaRecorder.stop();
-      }
-
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-      }
-
+      if (mediaRecorder) mediaRecorder.stop();
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      
+      // 清理視覺化資源
+      if (animationId) cancelAnimationFrame(animationId);
+      if (audioContext) audioContext.close();
+      visualizerBar.style.width = "0%";
+      
       startBtn.disabled = false;
       stopBtn.disabled = true;
     });
 
     uploadBtn.addEventListener("click", async () => {
-      if (!audioBlob) {
-        setStatus("No audio to upload.");
-        return;
-      }
-
+      if (!audioBlob) return;
       try {
-        setStatus("Uploading to n8n...");
-
-        const mimeType = audioBlob.type || "audio/webm";
-        const extension = mimeType.includes("mp4") ? "m4a" : "webm";
-        const file = new File([audioBlob], `recording.${extension}`, { type: mimeType });
-
+        setStatus("Uploading...");
         const formData = new FormData();
-        formData.append("audio", file);
-        formData.append("userId", "demo-user");
-        formData.append("note", "Recorded from browser");
-
-        const response = await fetch(webhookUrl, {
-          method: "POST",
-          body: formData
-        });
-
-        const contentType = response.headers.get("content-type") || "";
-        let data;
-
-        if (contentType.includes("application/json")) {
-          data = await response.json();
-          resultEl.textContent = JSON.stringify(data, null, 2);
-        } else {
-          data = await response.text();
-          resultEl.textContent = data;
-        }
-
-        setStatus(`Upload complete. HTTP ${response.status}`);
-      } catch (error) {
-        console.error(error);
-        setStatus("Upload failed: " + error.message);
+        formData.append("audio", audioBlob, "recording.webm");
+        
+        const response = await fetch(webhookUrl, { method: "POST", body: formData });
+        const data = await response.json().catch(() => response.text());
+        resultEl.textContent = JSON.stringify(data, null, 2);
+        setStatus(`Upload complete. Status: ${response.status}`);
+      } catch (err) {
+        setStatus("Upload failed: " + err.message);
       }
     });
   </script>
